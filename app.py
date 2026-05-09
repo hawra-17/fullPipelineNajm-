@@ -30,11 +30,15 @@ from datetime import datetime, timezone
 
 import requests
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 
 # Importing Pipeline loads YOLO + EasyOCR models at module import time.
 import Pipeline
 
 app = Flask(__name__)
+# Allow browser clients (React app) to call this API cross-origin.
+# For prod, narrow this to your real frontend origin instead of "*".
+CORS(app, resources={r"/*": {"origins": "*"}})
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
@@ -53,31 +57,41 @@ def health():
 
 @app.post("/analyze")
 def analyze():
-    if "image" not in request.files:
-        return jsonify({"error": "missing 'image' file in multipart form-data"}), 400
-
-    f = request.files["image"]
-    if f.filename == "" or not _ext_ok(f.filename):
-        return jsonify({"error": f"unsupported file (allowed: {sorted(ALLOWED_EXTS)})"}), 400
-
     incident_id = request.form.get("incident_id", "").strip()
     if not incident_id:
         return jsonify({"error": "missing 'incident_id' (e.g. INC-2026-04-001)"}), 400
 
-    suffix = "." + f.filename.rsplit(".", 1)[1].lower()
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        f.save(tmp.name)
-        tmp_path = tmp.name
+    # Image is optional during development. If omitted, fall back to ./test.png.
+    tmp_path = None
+    used_fallback = False
+    if "image" in request.files and request.files["image"].filename:
+        f = request.files["image"]
+        if not _ext_ok(f.filename):
+            return jsonify({"error": f"unsupported file (allowed: {sorted(ALLOWED_EXTS)})"}), 400
+        suffix = "." + f.filename.rsplit(".", 1)[1].lower()
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            f.save(tmp.name)
+            tmp_path = tmp.name
+    else:
+        fallback = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test.png")
+        if not os.path.exists(fallback):
+            return jsonify({"error": "no image sent and fallback test.png not found"}), 400
+        tmp_path = fallback
+        used_fallback = True
 
     try:
         result = Pipeline.run_pipeline_on_image(tmp_path)
     except Exception as e:
         return jsonify({"error": "pipeline failure", "detail": str(e)}), 500
     finally:
-        try:
-            os.remove(tmp_path)
-        except OSError:
-            pass
+        # Only delete the temp file if we created one — never delete test.png.
+        if not used_fallback and tmp_path:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+    result["used_fallback_image"] = used_fallback
 
     supabase_response = _update_supabase_incident(
         incident_id=incident_id,
